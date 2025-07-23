@@ -1,7 +1,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 use {
     console::Emoji,
-    indicatif::{ProgressBar, ProgressStyle},
+    indicatif::{HumanBytes, HumanDuration, ProgressBar, ProgressStyle},
     log::*,
     std::{
         fs::{self, File},
@@ -79,19 +79,11 @@ pub fn download_file<'a, 'b>(
             .expect("to_str")
     ));
 
-    let progress_bar = new_spinner_progress_bar();
-    if use_progress_bar {
-        progress_bar.set_message(format!("{TRUCK}Downloading {url}..."));
-    }
-
     let response = reqwest::blocking::Client::new()
         .get(url)
         .send()
         .and_then(|response| response.error_for_status())
-        .map_err(|err| {
-            progress_bar.finish_and_clear();
-            err.to_string()
-        })?;
+        .map_err(|err| err.to_string())?;
 
     let download_size = {
         response
@@ -102,29 +94,35 @@ pub fn download_file<'a, 'b>(
             .unwrap_or(0)
     };
 
-    if use_progress_bar {
+    let progress_bar = if use_progress_bar {
+        println!("{TRUCK}Downloading {url}...");
+        let progress_bar = new_spinner_progress_bar();
         progress_bar.set_length(download_size);
         progress_bar.set_style(
             ProgressStyle::default_bar()
                 .template(
-                    "{spinner:.green}{msg_wide}[{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+                    "{spinner:.green}{msg_wide}[{bar:40.cyan/blue}] {bytes} / {total_bytes} @ {binary_bytes_per_sec} ({eta} left)",
                 )
                 .expect("ProgresStyle::template direct input to be correct")
                 .progress_chars("=> "),
         );
-        progress_bar.set_message(format!("{TRUCK}Downloading~ {url}"));
+
+        Some(progress_bar)
     } else {
-        info!("Downloading {} bytes from {}", download_size, url);
-    }
+        info!(
+            "{TRUCK}Downloading {} from {url}",
+            HumanBytes(download_size)
+        );
+        None
+    };
 
     struct DownloadProgress<'e, 'f, R> {
-        progress_bar: ProgressBar,
+        progress_bar: Option<ProgressBar>,
         response: R,
         last_print: Instant,
         current_bytes: usize,
         last_print_bytes: usize,
-        download_size: f32,
-        use_progress_bar: bool,
+        download_size: usize,
         start_time: Instant,
         callback: &'f mut DownloadProgressCallbackOption<'e>,
         notification_count: u64,
@@ -139,7 +137,7 @@ pub fn download_file<'a, 'b>(
             let diff_bytes_f32 = (self.current_bytes - self.last_print_bytes) as f32;
             let last_throughput = diff_bytes_f32 / self.last_print.elapsed().as_secs_f32();
             let estimated_remaining_time = if last_throughput > 0_f32 {
-                (self.download_size - self.current_bytes as f32) / last_throughput
+                (self.download_size - self.current_bytes) as f32 / last_throughput
             } else {
                 f32::MAX
             };
@@ -150,14 +148,14 @@ pub fn download_file<'a, 'b>(
                 last_throughput,
                 total_throughput: self.current_bytes as f32
                     / self.start_time.elapsed().as_secs_f32(),
-                total_bytes: self.download_size as usize,
+                total_bytes: self.download_size,
                 current_bytes: self.current_bytes,
-                percentage_done: 100f32 * (total_bytes_f32 / self.download_size),
+                percentage_done: 100f32 * (total_bytes_f32 / self.download_size as f32),
                 estimated_remaining_time,
                 notification_count: self.notification_count,
             };
             let mut to_update_progress = false;
-            if progress_record.last_elapsed_time.as_secs() > 5 {
+            if progress_record.last_elapsed_time.as_secs() >= 5 {
                 self.last_print = Instant::now();
                 self.last_print_bytes = self.current_bytes;
                 to_update_progress = true;
@@ -165,14 +163,16 @@ pub fn download_file<'a, 'b>(
                 progress_record.notification_count = self.notification_count
             }
 
-            if self.use_progress_bar {
-                self.progress_bar.inc(n as u64);
+            if let Some(progress_bar) = self.progress_bar.as_ref() {
+                progress_bar.inc(n as u64);
             } else if to_update_progress {
                 info!(
-                    "downloaded {} bytes {:.1}% {:.1} bytes/s",
-                    self.current_bytes,
+                    "downloaded {} / {} ({:.1}%) @ {}/s ({:#} left)",
+                    HumanBytes(self.current_bytes as u64),
+                    HumanBytes(self.download_size as u64),
                     progress_record.percentage_done,
-                    progress_record.last_throughput,
+                    HumanBytes(progress_record.last_throughput as u64),
+                    HumanDuration(Duration::from_secs_f32(estimated_remaining_time)),
                 );
             }
 
@@ -193,8 +193,7 @@ pub fn download_file<'a, 'b>(
         last_print: Instant::now(),
         current_bytes: 0,
         last_print_bytes: 0,
-        download_size: (download_size as f32).max(1f32),
-        use_progress_bar,
+        download_size: download_size.max(1) as usize,
         start_time: Instant::now(),
         callback: progress_notify_callback,
         notification_count: 0,
@@ -204,17 +203,22 @@ pub fn download_file<'a, 'b>(
         .and_then(|mut file| std::io::copy(&mut source, &mut file))
         .map_err(|err| format!("Unable to write {temp_destination_file:?}: {err:?}"))?;
 
-    source.progress_bar.finish_and_clear();
-    info!(
-        "  {}{}",
-        SPARKLE,
-        format!(
-            "Downloaded {} ({} bytes) in {:?}",
-            url,
-            download_size,
-            Instant::now().duration_since(download_start),
-        )
+    if let Some(progress_bar) = source.progress_bar {
+        progress_bar.finish_and_clear();
+    }
+    let duration = Instant::now().duration_since(download_start);
+    let log = format!(
+        "{SPARKLE} Downloaded {url} {} @ {}/s in {:.2} s",
+        HumanBytes(download_size),
+        HumanBytes(((download_size as f32) / duration.as_secs_f32()) as u64),
+        duration.as_secs_f32(),
     );
+
+    if use_progress_bar {
+        println!("{log}");
+    } else {
+        info!("{log}");
+    }
 
     std::fs::rename(temp_destination_file, destination_file)
         .map_err(|err| format!("Unable to rename: {err:?}"))?;
