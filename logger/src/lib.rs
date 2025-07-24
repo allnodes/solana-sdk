@@ -14,7 +14,7 @@ lazy_static! {
         Arc::new(RwLock::new(env_logger::Logger::from_default_env()));
 }
 
-pub const DEFAULT_FILTER: &str = "solana=info,agave=info";
+pub const DEFAULT_FILTER: &str = "solana=info,agave=info,allnodes=info";
 
 struct LoggerShim {}
 
